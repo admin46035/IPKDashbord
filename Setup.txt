@@ -1,0 +1,263 @@
+/************************************************************
+ * Setup.gs — Konfigurasi & Upgrade Website Dashboard
+ * 
+ * ▶ Pemasangan baru : jalankan initialSetup() SEKALI
+ * ▶ Upgrade fitur   : jalankan upgradeScriptFeature() SEKALI
+ *   (aman untuk data lama — hanya menambah sheet/kolom baru)
+ * 
+ * Kedua fungsi idempotent: bisa dijalankan berulang tanpa
+ * menduplikasi data.
+ ************************************************************/
+
+function initialSetup() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+
+  setupSheetSettings_(ss);
+  setupSheetLinks_(ss);
+  setupSheetAdmins_(ss);
+  seedDefaultData_(ss);
+  verifyDriveFolder_();
+
+  // Fitur Script Library (v2)
+  setupSheetScripts_(ss);
+  ensureLinksScriptIdColumn_(ss);
+  getScriptLibraryFolder_();
+
+  saveDocumentationToDrive(); // simpan file panduan ke folder Drive
+
+  Logger.log('════════════════════════════════════════');
+  Logger.log('✅ SETUP SELESAI!');
+  Logger.log('➡️  Login default → username: admin | password: admin123');
+  Logger.log('⚠️  Segera ganti password melalui menu Admin → tab Akun.');
+  Logger.log('════════════════════════════════════════');
+}
+
+/* Upgrade khusus fitur Script Library — jalankan SEKALI pada instalasi lama */
+function upgradeScriptFeature() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+
+  setupSheetScripts_(ss);
+  ensureLinksScriptIdColumn_(ss);
+  const lib = getScriptLibraryFolder_();
+  saveDocumentationToDrive();
+
+  Logger.log('════════════════════════════════════════');
+  Logger.log('✅ FITUR SCRIPT LIBRARY AKTIF!');
+  Logger.log('📊 Sheet baru : SCRIPTS');
+  Logger.log('📊 Kolom baru : LINKS!K (ScriptId)');
+  Logger.log('📁 Folder pustaka: ' + lib.getName());
+  Logger.log('💡 Opsional: tambahkan Advanced Service "Apps Script API"');
+  Logger.log('   di editor agar fitur "Ambil Otomatis" berfungsi.');
+  Logger.log('════════════════════════════════════════');
+}
+
+/* ---------- Pembuatan Sheet ---------- */
+
+function setupSheetSettings_(ss) {
+  let sh = ss.getSheetByName(SHEET_SETTINGS);
+  if (!sh) {
+    sh = ss.insertSheet(SHEET_SETTINGS);
+    sh.getRange('A1:B1').setValues([['Key', 'Value']])
+      .setFontWeight('bold').setBackground('#059669').setFontColor('#FFFFFF');
+    sh.setFrozenRows(1);
+    sh.setColumnWidth(1, 220);
+    sh.setColumnWidth(2, 600);
+  }
+}
+
+function setupSheetLinks_(ss) {
+  let sh = ss.getSheetByName(SHEET_LINKS);
+  if (!sh) {
+    sh = ss.insertSheet(SHEET_LINKS);
+    sh.getRange('A1:K1').setValues([[
+      'ID', 'Name', 'URL', 'IconURL', 'Category',
+      'Description', 'SortOrder', 'Active', 'Clicks', 'CreatedAt', 'ScriptId'
+    ]]).setFontWeight('bold').setBackground('#059669').setFontColor('#FFFFFF');
+    sh.setFrozenRows(1);
+    sh.setColumnWidth(2, 200);
+    sh.setColumnWidth(3, 280);
+    sh.setColumnWidth(4, 280);
+    sh.setColumnWidth(11, 260);
+  }
+}
+
+function setupSheetAdmins_(ss) {
+  let sh = ss.getSheetByName(SHEET_ADMINS);
+  if (!sh) {
+    sh = ss.insertSheet(SHEET_ADMINS);
+    sh.getRange('A1:E1').setValues([[
+      'Username', 'PasswordHash', 'Salt', 'LastLogin', 'CreatedAt'
+    ]]).setFontWeight('bold').setBackground('#059669').setFontColor('#FFFFFF');
+    sh.setFrozenRows(1);
+  }
+}
+
+function setupSheetScripts_(ss) {
+  let sh = ss.getSheetByName(SHEET_SCRIPTS);
+  if (!sh) {
+    sh = ss.insertSheet(SHEET_SCRIPTS);
+    sh.getRange('A1:G1').setValues([[
+      'ID', 'WebsiteID', 'FileName', 'FileId', 'MimeType', 'Size', 'UpdatedAt'
+    ]]).setFontWeight('bold').setBackground('#047857').setFontColor('#FFFFFF');
+    sh.setFrozenRows(1);
+    sh.setColumnWidth(3, 260);
+    sh.setColumnWidth(4, 300);
+  }
+}
+
+/* Tambahkan kolom K "ScriptId" di sheet LINKS jika belum ada (migrasi aman) */
+function ensureLinksScriptIdColumn_(ss) {
+  const sh = ss.getSheetByName(SHEET_LINKS);
+  if (!sh) return;
+  if (String(sh.getRange('K1').getValue()).trim().toUpperCase() !== 'SCRIPTID') {
+    sh.getRange('K1').setValue('ScriptId')
+      .setFontWeight('bold').setBackground('#059669').setFontColor('#FFFFFF');
+    sh.setColumnWidth(11, 260);
+  }
+}
+
+/* ---------- Data Awal (hanya diisi bila sheet kosong) ---------- */
+
+function seedDefaultData_(ss) {
+  /* SETTINGS */
+  const shSet = ss.getSheetByName(SHEET_SETTINGS);
+  if (shSet.getLastRow() < 2) {
+    shSet.getRange(2, 1, 8, 2).setValues([
+      ['siteName',       'My Dashboard'],
+      ['siteLogo',       ''],
+      ['headerImage',    ''],
+      ['headerTitle',    'Selamat Datang 👋'],
+      ['headerSubtitle', 'Akses cepat ke semua website favorit Anda dari satu tempat.'],
+      ['footerText',     '© ' + new Date().getFullYear() + ' My Dashboard — Dibuat dengan Google Apps Script'],
+      ['defaultTheme',   'light'],
+      ['accentColor',    '#10b981']
+    ]);
+  }
+
+  /* LINKS — contoh data */
+  const shLinks = ss.getSheetByName(SHEET_LINKS);
+  if (shLinks.getLastRow() < 2) {
+    const sample = [
+      ['Google',    'https://www.google.com',   'https://www.google.com/favicon.ico',  'Search Engine', 'Mesin pencari paling populer', 1],
+      ['YouTube',   'https://www.youtube.com',  'https://www.youtube.com/favicon.ico', 'Media',         'Platform video terbesar dunia', 2],
+      ['Gmail',     'https://mail.google.com',  'https://ssl.gstatic.com/ui/v1/icons/mail/rfr/gmail.ico', 'Productivity', 'Email dari Google', 3],
+      ['Drive',     'https://drive.google.com', 'https://ssl.gstatic.com/images/branding/product/1x/drive_2020q4_32dp.png', 'Productivity', 'Penyimpanan cloud Google', 4],
+      ['GitHub',    'https://github.com',       'https://github.githubassets.com/favicons/favicon.svg', 'Dev', 'Hosting kode & kolaborasi', 5],
+      ['Wikipedia', 'https://www.wikipedia.org','https://www.wikipedia.org/static/favicon/wikipedia.ico', 'Referensi', 'Ensiklopedia bebas', 6]
+    ];
+    const stamp = nowStamp_();
+    const rows = sample.map(function(r) {
+      return [Utilities.getUuid(), r[0], r[1], r[2], r[3], r[4], r[5], 'TRUE', 0, stamp, ''];
+    });
+    shLinks.getRange(2, 1, rows.length, 11).setValues(rows);
+  }
+
+  /* ADMINS — akun default */
+  const shAdm = ss.getSheetByName(SHEET_ADMINS);
+  if (shAdm.getLastRow() < 2) {
+    const salt = Utilities.getUuid();
+    shAdm.appendRow([
+      'admin',
+      hashPassword_('admin123', salt),
+      salt,
+      '',
+      nowStamp_()
+    ]);
+  }
+}
+
+function verifyDriveFolder_() {
+  try {
+    const folder = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+    Logger.log('📁 Folder Drive OK: ' + folder.getName());
+  } catch (e) {
+    throw new Error('Folder Drive "' + DRIVE_FOLDER_ID + '" tidak dapat diakses. Periksa ID & izin folder.');
+  }
+}
+
+/* ---------- File Pendukung di Folder Drive ---------- */
+
+/* Simpan file PANDUAN ke folder Drive */
+function saveDocumentationToDrive() {
+  const guide = [
+    '# PANDUAN WEBSITE DASHBOARD (Google Apps Script) — v2',
+    '',
+    '## Komponen',
+    '- Code.gs   : backend/API (jangan hapus konstanta ID di bagian atas)',
+    '- Setup.gs  : konfigurasi awal (initialSetup) & upgrade (upgradeScriptFeature)',
+    '- Index.html: tampilan dashboard',
+    '- Sheet SETTINGS / LINKS / ADMINS / SCRIPTS di Google Spreadsheet terkait',
+    '- Folder Drive ini: gambar upload, SCRIPT-LIBRARY, backup data, dan panduan',
+    '',
+    '## Login Admin',
+    '- Username default: admin | Password default: admin123',
+    '- SEGERA ganti password via Admin Panel → tab Akun.',
+    '- Lupa password? Jalankan resetAdminPassword("passwordBaru") di editor.',
+    '',
+    '## Struktur Sheet',
+    '- SETTINGS : pasangan Key-Value (siteName, siteLogo, headerImage,',
+    '  headerTitle, headerSubtitle, footerText, defaultTheme, accentColor)',
+    '- LINKS    : ID | Name | URL | IconURL | Category | Description |',
+    '  SortOrder | Active(TRUE/FALSE) | Clicks | CreatedAt | ScriptId',
+    '- ADMINS   : Username | PasswordHash | Salt | LastLogin | CreatedAt',
+    '- SCRIPTS  : ID | WebsiteID | FileName | FileId | MimeType | Size | UpdatedAt',
+    '',
+    '## Fitur Script Library (v2)',
+    '- Admin Panel → tab "Script": pilih website → kelola file source code-nya.',
+    '- Ambil Otomatis: tempel Script ID / URL editor proyek GAS, sistem menarik',
+    '  seluruh file (Code.gs, Index.html, appsscript.json) via Apps Script API.',
+    '  * Wajib: tambahkan Advanced Service "Apps Script API" di editor GAS',
+    '    (sidebar kiri → Services + → Apps Script API).',
+    '  * Hanya untuk proyek yang bisa diakses akun pemilik web app ini.',
+    '- Upload Manual: file .gs / .html / .js / .json / .txt / .md (maks 10 MB/file).',
+    '- Download: per file, atau ZIP seluruh file website terpilih (maks 10 MB).',
+    '- File dengan nama sama akan MENIMPA versi lama (update aman).',
+    '- File tersimpan di: folder ini → SCRIPT-LIBRARY/<NamaWebsite>_<id>.',
+    '- Menghapus kartu website TIDAK menghapus file script di Drive',
+    '  (bersihkan manual di folder SCRIPT-LIBRARY bila diperlukan).',
+    '',
+    '## Tips',
+    '- Icon tiap kartu: gunakan favicon website atau upload lewat Admin Panel.',
+    '- Gambar header disarankan rasio lebar (mis. 1600x500 px).',
+    '- Setelah mengubah kode, lakukan Deploy → Manage deployments → Edit →',
+    '  Version: New version → Deploy, agar perubahan tampil.',
+    '- Jalankan backupDataToDrive() secara berkala untuk backup otomatis.',
+    '',
+    'Diperbarui: ' + nowStamp_()
+  ].join('\n');
+
+  const folder = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+  const existing = folder.getFilesByName('PANDUAN-DASHBOARD.md');
+  while (existing.hasNext()) existing.next().setTrashed(true);
+  const file = folder.createFile('PANDUAN-DASHBOARD.md', guide, 'text/markdown');
+  Logger.log('📄 Panduan disimpan: ' + file.getUrl());
+  return file.getUrl();
+}
+
+/* Backup data (settings + links + metadata scripts) ke folder Drive */
+function backupDataToDrive() {
+  const folder = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+  const payload = {
+    backupAt: nowStamp_(),
+    settings: getSettings_(),
+    links: getLinks_(false)
+  };
+  const name = 'BACKUP-dashboard-' +
+    Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd-HHmmss') + '.json';
+  const file = folder.createFile(name, JSON.stringify(payload, null, 2), 'application/json');
+  Logger.log('✅ Backup dibuat: ' + file.getUrl());
+  return file.getUrl();
+}
+
+/* ---------- Utilitas Pemulihan ---------- */
+
+/* Lupa password? Jalankan dari editor: resetAdminPassword("rahasiaBaru123") */
+function resetAdminPassword(newPassword) {
+  if (!newPassword || String(newPassword).length < 6) {
+    throw new Error('Berikan password minimal 6 karakter, contoh: resetAdminPassword("rahasia123")');
+  }
+  const sh = getSheet_(SHEET_ADMINS);
+  const salt = Utilities.getUuid();
+  sh.getRange(2, 1, 1, 3).setValues([['admin', hashPassword_(String(newPassword), salt), salt]]);
+  Logger.log('✅ Password admin direset menjadi: ' + newPassword);
+}

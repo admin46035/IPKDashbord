@@ -1,0 +1,593 @@
+/************************************************************
+ * Code.gs — Backend Utama Website Dashboard (v2)
+ * 
+ * v2: + Script Library (sheet SCRIPTS, kolom ScriptId)
+ *     + Upload/download/ZIP source code per website
+ *     + fetchGasProject: tarik source dari proyek GAS via Script ID
+ * 
+ * Spreadsheet : 1ZaDVf2rBj_BMwF0jPr6kWd_qLI0pfDwxl-5MFo2PuH4
+ * Drive Folder: 1o8MdP70H_GNCG6WuRAswWykw7W0KQ0aC
+ ************************************************************/
+
+const SPREADSHEET_ID  = '1YqS9KxgfjRaZJMh5qNrJEW8ShLUyr5eATec6MqIMHDA';
+const DRIVE_FOLDER_ID = '1Ez_g5KMpDpe5XcqoCvFhNL6dTCtjyrgs';
+const SHEET_SETTINGS  = 'SETTINGS';
+const SHEET_LINKS     = 'LINKS';
+const SHEET_ADMINS    = 'ADMINS';
+const SHEET_SCRIPTS   = 'SCRIPTS';
+const LIB_FOLDER_NAME = 'SCRIPT-LIBRARY';
+const SESSION_SECONDS = 21600; // 6 jam (maksimal CacheService)
+
+/* ==================== WEB APP ENTRY ==================== */
+
+function doGet() {
+  let siteName = 'Dashboard';
+  try { siteName = getSettings_().siteName || siteName; } catch (e) {}
+  const t = HtmlService.createTemplateFromFile('Index');
+  t.siteName = siteName;
+  return t.evaluate()
+    .setTitle(siteName)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1.0')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function include(filename) {
+  return HtmlService.createHtmlOutputFromFile(filename).getContent();
+}
+
+/* ==================== HELPERS ==================== */
+
+function getSS() {
+  return SpreadsheetApp.openById(SPREADSHEET_ID);
+}
+
+function getSheet_(name) {
+  const sh = getSS().getSheetByName(name);
+  if (!sh) throw new Error('Sheet "' + name + '" tidak ditemukan. Jalankan upgradeScriptFeature() atau initialSetup() dahulu.');
+  return sh;
+}
+
+function hashPassword_(password, salt) {
+  const raw = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256, password + salt, Utilities.Charset.UTF_8);
+  return raw.map(function(b) {
+    return ('0' + (b & 0xFF).toString(16)).slice(-2);
+  }).join('');
+}
+
+function nowStamp_() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
+}
+
+/* Konversi URL Google Drive apa pun menjadi URL gambar langsung (direct view) */
+function normalizeImageUrl_(url) {
+  const s = String(url || '').trim();
+  if (!s) return '';
+  if (s.indexOf('drive.google.com') !== -1 || s.indexOf('docs.google.com') !== -1) {
+    const m = s.match(/(?:\/file\/d\/|\/d\/|[?&]id=)([-\w]{20,})/);
+    if (m) return 'https://drive.google.com/thumbnail?id=' + m[1] + '&sz=w1200';
+  }
+  return s;
+}
+
+/* Ekstrak Script ID dari input (terima ID mentah ATAU URL editor Apps Script) */
+function extractScriptId_(input) {
+  const s = String(input || '').trim();
+  if (!s) return '';
+  const m = s.match(/\/d\/([a-zA-Z0-9_-]{20,})/);
+  if (m) return m[1];
+  if (/^[a-zA-Z0-9_-]{20,}$/.test(s)) return s;
+  return s;
+}
+
+/* Bersihkan nama untuk nama file/folder Drive */
+function sanitizeName_(s) {
+  const clean = String(s || '').replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim();
+  return (clean || 'Website').slice(0, 40);
+}
+
+/* ==================== SESSION / AUTENTIKASI ==================== */
+
+function createSession_(username) {
+  const token = Utilities.getUuid();
+  CacheService.getScriptCache().put('sess_' + token,
+    JSON.stringify({ u: username, t: Date.now() }), SESSION_SECONDS);
+  return token;
+}
+
+function requireAuth_(token) {
+  const raw = token ? CacheService.getScriptCache().get('sess_' + token) : null;
+  if (!raw) throw new Error('UNAUTHORIZED: Sesi berakhir, silakan login ulang.');
+  const sess = JSON.parse(raw);
+  sess.token = token;
+  return sess;
+}
+
+function checkSession(token) {
+  try {
+    const sess = requireAuth_(token);
+    return { valid: true, username: sess.u };
+  } catch (e) {
+    return { valid: false };
+  }
+}
+
+function adminLogin(username, password) {
+  try {
+    const sh = getSheet_(SHEET_ADMINS);
+    const data = sh.getDataRange().getValues();
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][0]).trim().toLowerCase() === String(username).trim().toLowerCase()) {
+        const hash = hashPassword_(String(password), String(data[i][2]));
+        if (hash === String(data[i][1])) {
+          sh.getRange(i + 1, 4).setValue(nowStamp_());
+          return { success: true, token: createSession_(data[i][0]), username: data[i][0] };
+        }
+        break;
+      }
+    }
+    return { success: false, message: 'Username atau password salah.' };
+  } catch (err) {
+    return { success: false, message: err.message };
+  }
+}
+
+function adminLogout(token) {
+  if (token) CacheService.getScriptCache().remove('sess_' + token);
+  return { success: true };
+}
+
+function updateAccount(token, currentPassword, newUsername, newPassword) {
+  const sess = requireAuth_(token);
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    newPassword = String(newPassword || '').trim();
+    newUsername = String(newUsername || '').trim();
+    if (newPassword && newPassword.length < 6)
+      return { success: false, message: 'Password baru minimal 6 karakter.' };
+
+    const sh = getSheet_(SHEET_ADMINS);
+    const data = sh.getDataRange().getValues();
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][0]).trim().toLowerCase() === String(sess.u).trim().toLowerCase()) {
+        const hash = hashPassword_(String(currentPassword), String(data[i][2]));
+        if (hash !== String(data[i][1]))
+          return { success: false, message: 'Password lama salah.' };
+        if (newPassword) {
+          const salt = Utilities.getUuid();
+          sh.getRange(i + 1, 2).setValue(hashPassword_(newPassword, salt));
+          sh.getRange(i + 1, 3).setValue(salt);
+        }
+        if (newUsername) {
+          sh.getRange(i + 1, 1).setValue(newUsername);
+          CacheService.getScriptCache().put('sess_' + sess.token,
+            JSON.stringify({ u: newUsername, t: sess.t }), SESSION_SECONDS);
+        }
+        return { success: true, username: newUsername || sess.u };
+      }
+    }
+    return { success: false, message: 'Akun admin tidak ditemukan.' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/* ==================== PENGATURAN WEBSITE ==================== */
+
+function getSettings_() {
+  const sh = getSheet_(SHEET_SETTINGS);
+  const data = sh.getDataRange().getValues();
+  const obj = {};
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][0]) obj[String(data[i][0]).trim()] = data[i][1];
+  }
+  return obj;
+}
+
+function getPublicData() {
+  return { settings: getSettings_(), links: getLinks_(true) };
+}
+
+function saveSettings(token, settings) {
+  requireAuth_(token);
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const sh = getSheet_(SHEET_SETTINGS);
+    const data = sh.getDataRange().getValues();
+    const rowOfKey = {};
+    for (let i = 1; i < data.length; i++) {
+      if (data[i][0]) rowOfKey[String(data[i][0]).trim()] = i + 1;
+    }
+    Object.keys(settings).forEach(function(key) {
+      let value = settings[key];
+      if (key === 'siteLogo' || key === 'headerImage') value = normalizeImageUrl_(value);
+      if (rowOfKey[key]) sh.getRange(rowOfKey[key], 2).setValue(value);
+      else sh.appendRow([key, value]);
+    });
+    return { success: true, settings: getSettings_() };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/* ==================== MANAJEMEN TAUTAN ==================== */
+
+function getLinks_(activeOnly) {
+  const sh = getSheet_(SHEET_LINKS);
+  const data = sh.getDataRange().getValues();
+  const links = [];
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    if (!r[0]) continue;
+    const link = {
+      row: i + 1,
+      id: String(r[0]),
+      name: String(r[1] || ''),
+      url: String(r[2] || ''),
+      iconUrl: String(r[3] || ''),
+      category: String(r[4] || ''),
+      description: String(r[5] || ''),
+      sortOrder: Number(r[6]) || i,
+      active: !(String(r[7]).trim().toUpperCase() === 'FALSE'),
+      clicks: Number(r[8]) || 0,
+      createdAt: r[9] ? String(r[9]) : '',
+      scriptId: String(r[10] || '')   // kolom K (baru)
+    };
+    if (!activeOnly || link.active) links.push(link);
+  }
+  links.sort(function(a, b) { return a.sortOrder - b.sortOrder; });
+  return links;
+}
+
+function findLinkById_(id) {
+  const links = getLinks_(false);
+  for (let i = 0; i < links.length; i++) {
+    if (links[i].id === String(id)) return links[i];
+  }
+  return null;
+}
+
+function saveLink(token, link) {
+  requireAuth_(token);
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const sh = getSheet_(SHEET_LINKS);
+    const data = sh.getDataRange().getValues();
+    let url = String(link.url || '').trim();
+    if (url && !/^https?:\/\//i.test(url)) url = 'https://' + url;
+
+    const rowVals = [
+      link.id || Utilities.getUuid(),
+      String(link.name || '').trim(),
+      url,
+      normalizeImageUrl_(link.iconUrl),
+      String(link.category || '').trim(),
+      String(link.description || '').trim(),
+      Number(link.sortOrder) || 999,
+      link.active === false ? 'FALSE' : 'TRUE',
+      0,
+      nowStamp_(),
+      extractScriptId_(link.scriptId)
+    ];
+
+    if (link.id) {
+      for (let i = 1; i < data.length; i++) {
+        if (String(data[i][0]) === String(link.id)) {
+          rowVals[8] = Number(data[i][8]) || 0;              // pertahankan jumlah klik
+          rowVals[9] = data[i][9] || nowStamp_();            // pertahankan tanggal buat
+          if (!rowVals[10]) rowVals[10] = String(data[i][10] || ''); // pertahankan ScriptId
+          sh.getRange(i + 1, 1, 1, 11).setValues([rowVals]);
+          return { success: true, id: rowVals[0], mode: 'update' };
+        }
+      }
+      throw new Error('Tautan tidak ditemukan.');
+    }
+    sh.appendRow(rowVals);
+    return { success: true, id: rowVals[0], mode: 'create' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function deleteLink(token, id) {
+  requireAuth_(token);
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const sh = getSheet_(SHEET_LINKS);
+    const data = sh.getDataRange().getValues();
+    for (let i = 1; i < data.length; i++) {
+      if (String(data[i][0]) === String(id)) {
+        sh.deleteRow(i + 1);
+        return { success: true };
+      }
+    }
+    throw new Error('Tautan tidak ditemukan.');
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/* Naik / turunkan urutan tautan (direction: 'up' | 'down') */
+function moveLink(token, id, direction) {
+  requireAuth_(token);
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const links = getLinks_(false);
+    let idx = -1;
+    for (let i = 0; i < links.length; i++) {
+      if (links[i].id === String(id)) { idx = i; break; }
+    }
+    if (idx === -1) throw new Error('Tautan tidak ditemukan.');
+    const target = direction === 'up' ? idx - 1 : idx + 1;
+    if (target < 0 || target >= links.length) return { success: true };
+
+    const a = links[idx], b = links[target];
+    const sh = getSheet_(SHEET_LINKS);
+    sh.getRange(a.row, 7).setValue(b.sortOrder);
+    sh.getRange(b.row, 7).setValue(a.sortOrder);
+    if (a.sortOrder === b.sortOrder) {
+      sh.getRange(a.row, 7).setValue(direction === 'up' ? b.sortOrder - 1 : b.sortOrder + 1);
+    }
+    return { success: true };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/* Statistik klik — dipanggil publik setiap kartu diklik */
+function trackClick(id) {
+  try {
+    const lock = LockService.getScriptLock();
+    lock.waitLock(5000);
+    try {
+      const sh = getSheet_(SHEET_LINKS);
+      const data = sh.getDataRange().getValues();
+      for (let i = 1; i < data.length; i++) {
+        if (String(data[i][0]) === String(id)) {
+          sh.getRange(i + 1, 9).setValue((Number(data[i][8]) || 0) + 1);
+          return { success: true };
+        }
+      }
+    } finally { lock.releaseLock(); }
+  } catch (e) { /* diamkan — klik tetap terbuka */ }
+  return { success: false };
+}
+
+/* ==================== UPLOAD GAMBAR KE DRIVE ==================== */
+
+function uploadImage(token, base64Data, fileName, mimeType) {
+  requireAuth_(token);
+  try {
+    const bytes = Utilities.base64Decode(base64Data);
+    if (bytes.length > 5 * 1024 * 1024) throw new Error('Ukuran file maksimal 5 MB.');
+
+    const folder = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+    const stamp  = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd-HHmmss');
+    const safeName = String(fileName || 'image').replace(/[^\w.\-]+/g, '_');
+    const blob = Utilities.newBlob(bytes, mimeType || 'image/png', stamp + '_' + safeName);
+    const file = folder.createFile(blob);
+
+    try {
+      file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    } catch (e) { /* akun Workspace tertentu membatasi sharing */ }
+
+    const url = 'https://drive.google.com/thumbnail?id=' + file.getId() + '&sz=w1200';
+    return { success: true, url: url, fileId: file.getId() };
+  } catch (err) {
+    return { success: false, message: err.message };
+  }
+}
+
+/* ==================== PUSTAKA SCRIPT (SCRIPT LIBRARY) ==================== */
+
+function getScriptLibraryFolder_() {
+  const root = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+  const it = root.getFoldersByName(LIB_FOLDER_NAME);
+  return it.hasNext() ? it.next() : root.createFolder(LIB_FOLDER_NAME);
+}
+
+/* Subfolder per website: <NamaWebsite>_<6 karakter awal ID> */
+function getWebsiteFolder_(websiteId, websiteName) {
+  const lib = getScriptLibraryFolder_();
+  const name = sanitizeName_(websiteName) + '_' + String(websiteId).slice(0, 6);
+  const it = lib.getFoldersByName(name);
+  return it.hasNext() ? it.next() : lib.createFolder(name);
+}
+
+/* Metadata semua file script milik sebuah website (tanpa isi file) */
+function listScriptFilesMeta_(websiteId) {
+  const sh = getSheet_(SHEET_SCRIPTS);
+  const data = sh.getDataRange().getValues();
+  const out = [];
+  for (let i = 1; i < data.length; i++) {
+    const r = data[i];
+    if (!r[0] || String(r[1]) !== String(websiteId)) continue;
+    out.push({
+      row: i + 1,
+      id: String(r[0]),
+      websiteId: String(r[1]),
+      fileName: String(r[2] || ''),
+      fileId: String(r[3] || ''),
+      mimeType: String(r[4] || 'text/plain'),
+      size: Number(r[5]) || 0,
+      updatedAt: r[6] ? String(r[6]) : ''
+    });
+  }
+  out.sort(function(a, b) {
+    return a.fileName.localeCompare(b.fileName, 'id', { numeric: true });
+  });
+  return out;
+}
+
+function listScriptFiles(token, websiteId) {
+  requireAuth_(token);
+  return listScriptFilesMeta_(websiteId);
+}
+
+/* Hapus baris + file Drive lama jika ada file dengan nama sama (timpa) */
+function removeScriptRow_(websiteId, fileName) {
+  const sh = getSheet_(SHEET_SCRIPTS);
+  const data = sh.getDataRange().getValues();
+  for (let i = data.length - 1; i >= 1; i--) {
+    if (String(data[i][1]) === String(websiteId) &&
+        String(data[i][2]) === String(fileName)) {
+      try { DriveApp.getFileById(String(data[i][3])).setTrashed(true); } catch (e) {}
+      sh.deleteRow(i + 1);
+    }
+  }
+}
+
+/* Upload satu/lebih file script: files = [{name, mime, b64}] */
+function uploadScriptFiles(token, websiteId, files) {
+  requireAuth_(token);
+  websiteId = String(websiteId || '');
+  if (!websiteId) throw new Error('Pilih website tujuan terlebih dahulu.');
+  if (!files || !files.length) throw new Error('Tidak ada file untuk diunggah.');
+
+  const link = findLinkById_(websiteId);
+  const folder = getWebsiteFolder_(websiteId, link ? link.name : 'Website');
+  const sh = getSheet_(SHEET_SCRIPTS);
+  const stamp = nowStamp_();
+  const saved = [];
+
+  files.forEach(function(f) {
+    const bytes = Utilities.base64Decode(f.b64);
+    if (bytes.length > 10 * 1024 * 1024) throw new Error('File "' + f.name + '" melebihi 10 MB.');
+    removeScriptRow_(websiteId, f.name); // timpa versi lama bernama sama
+    const blob = Utilities.newBlob(bytes, f.mime || 'text/plain', f.name);
+    const file = folder.createFile(blob);
+    sh.appendRow([Utilities.getUuid(), websiteId, f.name, file.getId(),
+                  blob.getContentType(), file.getSize(), stamp]);
+    saved.push(f.name);
+  });
+
+  return { success: true, saved: saved, files: listScriptFilesMeta_(websiteId) };
+}
+
+function deleteScriptFile(token, id) {
+  requireAuth_(token);
+  const sh = getSheet_(SHEET_SCRIPTS);
+  const data = sh.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]) === String(id)) {
+      try { DriveApp.getFileById(String(data[i][3])).setTrashed(true); } catch (e) {}
+      sh.deleteRow(i + 1);
+      return { success: true };
+    }
+  }
+  throw new Error('File tidak ditemukan.');
+}
+
+/* Download satu file — kembalikan base64 ke client */
+function downloadScriptFile(token, id) {
+  requireAuth_(token);
+  const data = getSheet_(SHEET_SCRIPTS).getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]) === String(id)) {
+      const file = DriveApp.getFileById(String(data[i][3]));
+      const blob = file.getBlob();
+      return {
+        fileName: String(data[i][2]) || file.getName(),
+        mimeType: blob.getContentType() || 'text/plain',
+        b64: Utilities.base64Encode(blob.getBytes())
+      };
+    }
+  }
+  throw new Error('File tidak ditemukan.');
+}
+
+/* Download semua script sebuah website sebagai ZIP */
+function downloadScriptsZip(token, websiteId) {
+  requireAuth_(token);
+  websiteId = String(websiteId || '');
+  if (!websiteId) throw new Error('Pilih website terlebih dahulu.');
+
+  const metas = listScriptFilesMeta_(websiteId);
+  if (!metas.length) throw new Error('Belum ada file script untuk website ini.');
+
+  const blobs = metas.map(function(m) {
+    return DriveApp.getFileById(m.fileId).getBlob();
+  });
+  const total = blobs.reduce(function(s, b) { return s + b.getBytes().length; }, 0);
+  if (total > 10 * 1024 * 1024)
+    throw new Error('Total ukuran melebihi 10 MB — unduh file satu per satu.');
+
+  const link = findLinkById_(websiteId);
+  const zipName = sanitizeName_(link ? link.name : 'Website') + '-scripts-' +
+    Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd-HHmmss') + '.zip';
+  const zip = Utilities.zip(blobs, zipName);
+
+  return { fileName: zipName, b64: Utilities.base64Encode(zip.getBytes()) };
+}
+
+/* Tarik seluruh source code proyek GAS lain via Apps Script API.
+   ⚠️ Wajib: tambahkan Advanced Service "Apps Script API" di editor
+   (Services + → Apps Script API) dan Anda punya akses ke proyek tersebut. */
+function fetchGasProject(token, websiteId, scriptIdInput) {
+  requireAuth_(token);
+  websiteId = String(websiteId || '');
+  if (!websiteId) throw new Error('Pilih website tujuan terlebih dahulu.');
+
+  const scriptId = extractScriptId_(scriptIdInput);
+  if (!scriptId) throw new Error('Script ID tidak dikenali. Tempelkan ID proyek atau URL editor Apps Script.');
+
+  let project;
+  try {
+    project = Script.Projects.getContent({ scriptId: scriptId });
+  } catch (err) {
+    throw new Error('Gagal mengambil proyek: ' + err.message +
+      ' | Pastikan (1) Advanced Service "Apps Script API" sudah ditambahkan di editor, ' +
+      '(2) Anda memiliki akses ke proyek tersebut.');
+  }
+
+  const files = project.files || [];
+  if (!files.length) throw new Error('Proyek tidak memiliki file script.');
+
+  const link = findLinkById_(websiteId);
+  const folder = getWebsiteFolder_(websiteId, link ? link.name : 'Website');
+  const sh = getSheet_(SHEET_SCRIPTS);
+  const stamp = nowStamp_();
+  const saved = [];
+
+  files.forEach(function(f) {
+    let fname;
+    if (f.type === 'SERVER_JS')  fname = (f.name || 'Code') + '.gs';
+    else if (f.type === 'HTML')  fname = (f.name || 'Index') + '.html';
+    else if (f.type === 'JSON')  fname = (String(f.name || 'appsscript').indexOf('.') === -1) ? f.name + '.json' : f.name;
+    else                         fname = (f.name || 'file') + '.txt';
+
+    removeScriptRow_(websiteId, fname); // timpa versi lama bernama sama
+    const blob = Utilities.newBlob(f.source || '', 'text/plain', fname);
+    const file = folder.createFile(blob);
+    sh.appendRow([Utilities.getUuid(), websiteId, fname, file.getId(),
+                  'text/plain', file.getSize(), stamp]);
+    saved.push(fname);
+  });
+
+  saveScriptIdToLink_(websiteId, scriptId);
+  return { success: true, saved: saved, files: listScriptFilesMeta_(websiteId) };
+}
+
+/* Simpan Script ID ke kolom K pada sheet LINKS */
+function saveScriptIdToLink_(websiteId, scriptId) {
+  const sh = getSheet_(SHEET_LINKS);
+  const data = sh.getDataRange().getValues();
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i][0]) === String(websiteId)) {
+      sh.getRange(i + 1, 11).setValue(scriptId);
+      return;
+    }
+  }
+}
+
+/* ==================== DATA ADMIN ==================== */
+
+function getAdminData(token) {
+  requireAuth_(token);
+  return { settings: getSettings_(), links: getLinks_(false) };
+}
